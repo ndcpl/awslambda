@@ -1,58 +1,88 @@
-from __future__ import print_function
-
-import boto3
-from decimal import Decimal
 import json
-import urllib
+import boto3
 
-rekognition = boto3.client('rekognition')
-client = boto3.client('sns')
-
-def detect_labels(bucket, key):
-    response = rekognition.detect_labels(Image={"S3Object": {"Bucket": bucket, "Name": key}})
-
-    
-    return response
+s3_client = boto3.client('s3')
+rekognition_client = boto3.client('rekognition')
+sns_client = boto3.client('sns')
+sqs_queue_url = 'https://sqs.us-east-1.amazonaws.com/323708512535/SQSImage'
+sns_topic_arn = 'arn:aws:sns:us-east-1:323708512535:notify_users'
 
 def lambda_handler(event, context):
-    print (event)
-    #Loops through every file uploaded
-
+    
+  # Print the event to check its structure
+    
     for record in event['Records']:
-
-        #pull the body out & json load it
-
-        jsonmaybe=(record["body"])
-
-        jsonmaybe=json.loads(jsonmaybe)
-
-        #now the normal stuff works
-
-        bucket = jsonmaybe["Records"][0]["s3"]["bucket"]["name"]
-        print(bucket)
-
-        key=jsonmaybe["Records"][0]["s3"]["object"]["key"]
-        print(key)
-        
-    try:
-
-        # Calls rekognition DetectLabels API to detect labels in S3 object
-        response = detect_labels(bucket, key)
-        
-        tosend=""
-        
-        for Label in response["Labels"]:
-            # print (Label["Name"] + Label["Confidence"])
+        record= json.loads(record['body'])
+        # Access the S3 bucket and object key from the record
+        s3_bucket = record['Records'][0]['s3']['bucket']['name']
+        s3_object_key = record['Records'][0]['s3']['object']['key']
+        try:    
+            # Perform image analysis using AWS Rekognition
+            response = rekognition_client.detect_labels(
+                Image={
+                    'S3Object': {
+                        'Bucket': s3_bucket,
+                        'Name': s3_object_key
+                    }
+                },
+                MaxLabels=10,
+                MinConfidence=80
+            )
             
-            print ('{0} - {1}%'.format(Label["Name"], Label["Confidence"]))
-            tosend+= '{0} - {1}% '.format(Label["Name"], Label["Confidence"])
+            # Determine if the analysis is successful based on desired labels and confidence threshold
+            desired_labels = ['Widgets','Smartphones']  # Add your desired labels here
+            confidence_threshold = 80  # Set your desired confidence threshold
+            
+            labels = [label['Name'] for label in response['Labels']]
+            confidences = [label['Confidence'] for label in response['Labels']]
+            
+            success = any(label in desired_labels and confidence >= confidence_threshold
+                          for label, confidence in zip(labels, confidences))
+            
+            print(f"Labels: {labels}")
+            print(f"Confidences: {confidences}")
+            print(f"Success: {success}")
+            
+            # Move the original image to the appropriate folder in the S3 bucket
+            destination_folder = 'analyzed/success' if success else 'analyzed/failure'
+            destination_key = f'{destination_folder}/{s3_object_key}'
+            
+            s3_client.copy_object(
+                Bucket=s3_bucket,
+                CopySource={'Bucket': s3_bucket, 'Key': s3_object_key},
+                Key=destination_key
+            )
+            
+            print(f"Image moved to: s3://{s3_bucket}/{destination_key}")
+            
+            # Delete the original image from the /images folder
+            s3_client.delete_object(
+                Bucket=s3_bucket,
+                Key=s3_object_key
+            )
+            
+            print(f"Image deleted: s3://{s3_bucket}/{s3_object_key}")
+            
+            # Publish the analysis results to the SNS topic
+            message = {
+                'success': success,
+                'labels': labels,
+                'confidences': confidences
+            }
+            
+            sns_client.publish(
+                TopicArn=sns_topic_arn,
+                Message=json.dumps(message)
+            )
+            
+            print("Analysis results published to SNS")
         
-        
-        print(response)
-        message = client.publish(TargetArn='arn:aws:sns:us-east-1:323708512535:notify_users', Message=tosend ,Subject='Uploaded Image Labels')
-        return response
-    except Exception as e:
-        print(e)
-        print("Error processing object {} from bucket {}. ".format(key, bucket) +
-              "Make sure your object and bucket exist and your bucket is in the same region as this function.")
-        raise e
+        except Exception as e:
+            print(f"Error processing object: {s3_object_key} from bucket: {s3_bucket}")
+            print(str(e))
+            raise e
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Image processing completed.')
+    }
